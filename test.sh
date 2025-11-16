@@ -1,0 +1,11 @@
+python test.py \
+  --model gauss \
+  --stages 4 \
+  --bits 12 \
+  --norm \
+  --m 0123 \
+  --batch 36 \
+  --img_size 128 \
+  --m "0123" \
+  --ckpt "/home/wonjung/mobile/output/gauss_rayleigh_L4_12b_v1_True.pt" \
+  --out_dir "/home/wonjung/mobile/output/test_gauss_rayleigh_Kodak_L4_12b_v1_True"
