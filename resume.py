@@ -90,7 +90,7 @@ class ResUME(nn.Module):
         loss_codebook = 0.0
         loss_commitment = 0.0
 
-        for l in range(0, sum_stages):
+        for l in range(0, len(m_idx)):
             cb = self.codebooks[l]
 
             # ----------- (1) residue setting -----------------
