@@ -6,7 +6,7 @@ from torchvision.utils import make_grid, save_image
 import numpy as np
 import os
 from dataloader import ImageNet_Loader
-from networks import Digital_SemCom
+from networks import Digital_SemCom, Analog_SemCom, MobileNet_SemCom, MobileViT_SemCom
 import argparse
 from tqdm.auto import tqdm
 import math
@@ -79,7 +79,6 @@ def log_and_replace(log_state, *, model, used_codebook_indices,
 
 # Hyper-parameters
 batch_size = 144
-modulation = 'qam'
 snr_max = 15
 model_ver = 1
 
@@ -95,9 +94,15 @@ parser.add_argument("--norm", action='store_true', help="Data Normalization")
 parser.add_argument("--fading", action='store_true', help="Rayleigh fading channel")
 parser.add_argument("--lr", type=float, help="Learning Rate", default=1e-4)
 parser.add_argument("--m", type=str, help="Modulation index sequence", default='0000')
+parser.add_argument("--kld_var", type=float, help="KLD sigma value", default=0.01)
+parser.add_argument("--target_cbr", type=float, help="Target CBR for Analog Transmission", default=1/64)
+parser.add_argument("--epochs", type=int, help="Number of training epochs", default=200)
+parser.add_argument("--nsvq", dest="nsvq", action="store_true", help="Enable NSVQ (default: on)")
+parser.add_argument("--no-nsvq", dest="nsvq", action="store_false", help="Disable NSVQ")
+parser.set_defaults(nsvq=True)
 args = parser.parse_args()
 
-max_epoch = 200
+max_epoch = args.epochs
 normal_mean = 0 #mean for normal distribution
 normal_std = 1 #standard deviation for normal distribution
 training_log_batches = 200 #number of batches to get logs of training
@@ -114,12 +119,16 @@ CR = 48 * 8 // vq_bitrate_per_stage
 embedding_dim = 128
 # embedding_dim = 96
 channel = "awgn" if args.fading == False else "rayleigh"
+ste_tag = "CANSVQ" if args.nsvq else "STE"
+print("NSVQ =", args.nsvq)
 
 if args.tune == False:
-    save_title = f'{args.model}_{channel}_L{args.stages}_{args.bits}b_v{args.version}_{args.norm}'
+    save_title = f'{args.model}_{ste_tag}_{channel}_L{args.stages}_{args.bits}b_v{args.version}_{args.norm}_kld_{args.kld_var}'
 else:
     args.lr = 1e-5
-    save_title = f'{args.model}_{channel}_L{args.stages}_{args.bits}b_v{args.version}_{args.norm}_revised'
+    save_title = f'{args.model}_{ste_tag}_{channel}_L{args.stages}_{args.bits}b_v{args.version}_{args.norm}_kld_{args.kld_var}_revised'
+
+print(f'SAVE TITLE: {save_title}')
 
 # Arrays to save the logs of training
 total_vq_loss = [] # tracks VQ loss
@@ -128,18 +137,31 @@ perplexity_list = [] # tracks perplexity
 eval_loss = []
 eval_ssim = []
 
-model = Digital_SemCom(num_hiddens=128,
-                     num_residual_hiddens=64,
-                     num_residual_layers=4,
-                     num_stages=args.stages,
-                     vq_bitrate_per_stage=vq_bitrate_per_stage,
-                     embedding_dim=embedding_dim,
-                     batch_size=args.batch,
-                     device=device,
-                     )
+if args.model == 'gauss':
+    model = Digital_SemCom(num_hiddens=128,
+                        num_residual_hiddens=64,
+                        num_residual_layers=4,
+                        num_stages=args.stages,
+                        vq_bitrate_per_stage=vq_bitrate_per_stage,
+                        embedding_dim=embedding_dim,
+                        batch_size=args.batch,
+                        device=device,
+                        )
+elif args.model == 'analog':
+    model = Analog_SemCom(num_hiddens=128,
+                        num_residual_hiddens=64,
+                        num_residual_layers=4,
+                        embedding_dim=embedding_dim,
+                        target_CBR=args.target_cbr,
+                        )
+    
+elif args.model == 'mobilenet':
+    model = MobileNet_SemCom(num_stages=4, vq_bitrate_per_stage=12, embedding_dim=embedding_dim, batch_size=args.batch, device=device)
+elif args.model == 'mobilevit':
+    model = MobileViT_SemCom(num_stages=4, vq_bitrate_per_stage=12, embedding_dim=embedding_dim, batch_size=args.batch, device=device)
 
 if args.tune == True:
-    model_name = f'./output/{args.model}_{args.stages}stages_B{args.bits}_ver{args.version}_{args.norm}.pt'
+    model_name = f'./output/{args.model}_{args.stages}stages_B{args.bits}_ver{args.version}_{args.norm}_kld_{args.kld_var}.pt'
     model.load_state_dict(torch.load(model_name)['end_to_end_model'])
     max_epoch = 100
 
@@ -216,12 +238,12 @@ for epoch in range(max_epoch):
         # m_idx = sorted(np.random.choice(5, 4, replace=True))
         optimizer.zero_grad()
 
-        rec_data, used_codebook_indices, perplexity, z_e, z_q, loss_commit = model(data, sum_stages, snr_db, m_idx, nsvq=True, rvq_activate = True, apply_fading=args.fading, equalizer='zf')
+        rec_data, used_codebook_indices, perplexity, z_e, z_q, loss_commit = model(data, sum_stages, snr_db, m_idx, nsvq=args.nsvq, rvq_activate = True, apply_fading=args.fading, equalizer='zf')
         commit_loss = (z_e - z_q.detach()).square().mean()
         embedding_loss = (z_q - z_e.detach()).square().mean()
         var_loss = F.mse_loss(z_e, torch.zeros_like(z_e))
 
-        target_variance = 0.01
+        target_variance = args.kld_var
         target_std = torch.sqrt(torch.tensor(target_variance))
         log_var = torch.log2(torch.var(z_q, dim=0) + 1e-9) # z_e: [~, 128]
         mu = torch.mean(z_q, dim=0)
@@ -233,20 +255,41 @@ for epoch in range(max_epoch):
         # vq_loss = F.mse_loss(rec_data, data) + 0.01*commit_loss + 0.1*(embedding_loss) +  0.1*var_loss # ver2
         # vq_loss = F.mse_loss(rec_data, data) + 0.01*commit_loss + 0.1*(embedding_loss) # ver3
         # vq_loss = F.mse_loss(rec_data, data)
+        # vq_loss =  F.mse_loss(rec_data, data) + 0.1*loss_commit
 
         vq_loss.backward()
         optimizer.step()
 
-        while len(perplexity) < args.stages:
-            perplexity.append(0.0)
+        # if args.model == 'gauss':
+        #     while len(perplexity) < args.stages:
+        #         perplexity.append(0.0)
 
 
-        epoch_loss_accum += vq_loss.item()
+        # epoch_loss_accum += vq_loss.item()
 
-        log_state["vq_loss_acc"] += vq_loss.item()
-        log_state["commit_acc"]  += commit_loss.item()
-        log_state["kl_acc"]      += kl_divergence.item()
-        log_state["perplex_acc"] += np.array(perplexity)
+        # log_state["vq_loss_acc"] += vq_loss.item()
+        # log_state["commit_acc"]  += commit_loss.item()
+        # log_state["kl_acc"]      += kl_divergence.item()
+        # if args.model == 'gauss':
+        #     log_state["perplex_acc"] += np.array(perplexity)
+
+        # 손실 값들 한 번만 .item() 호출해서 가져오기
+        vq_loss_val      = float(vq_loss.item())
+        commit_loss_val  = float(commit_loss.item())
+        kl_div_val       = float(kl_divergence.item())
+
+        epoch_loss_accum           += vq_loss_val
+        log_state["vq_loss_acc"]   += vq_loss_val
+        log_state["commit_acc"]    += commit_loss_val
+        log_state["kl_acc"]        += kl_div_val
+
+        if args.model != "analog":
+            # perplexity 길이를 stages에 맞춰 패딩/슬라이스한 배열 생성
+            perplex_arr = np.zeros(args.stages, dtype=np.float32)
+            n = min(len(perplexity), args.stages)
+            perplex_arr[:n] = np.array(perplexity[:n], dtype=np.float32)
+
+            log_state["perplex_acc"] += perplex_arr
 
         # ── tqdm postfix 갱신 ────────────────────────────────────────────
         train_pbar.set_postfix(
@@ -256,7 +299,7 @@ for epoch in range(max_epoch):
             stage      = sum_stages,
         )
 
-        if num_batch < total_batches:
+        if args.model != "analog" and num_batch < total_batches:
             next_stage = int(stage_seq[num_batch])  # 다음 배치의 stage
 
             # ── stage 변경 직전: 로그 + codebook replacement ──────────────
@@ -274,7 +317,7 @@ for epoch in range(max_epoch):
                     num_batch=num_batch,
                 )
 
-    if log_state["accum_steps"] > 0:
+    if args.model != "analog" and log_state["accum_steps"] > 0:
         log_and_replace(
             log_state,
             model=model,
@@ -297,7 +340,7 @@ for epoch in range(max_epoch):
     val_vq_loss_accumulator = 0.0
     val_ssim_accumulator   = 0.0
     save_address = './output/'
-    VAL_GRID_DIR = f"{save_address}/validation_{args.model}_{channel}_{args.stages}_{args.bits}"
+    VAL_GRID_DIR = f"{save_address}/validation/{args.nsvq}/{args.model}_{channel}_{args.stages}_{args.bits}/kld_{args.kld_var}"
     os.makedirs(VAL_GRID_DIR, exist_ok=True)
     DATA_RANGE = 2.0 if args.norm else 1.0
     model.eval()
@@ -315,7 +358,7 @@ for epoch in range(max_epoch):
             val_sum_stages = val_num_batch % args.stages + 1
             val_snr_db     = val_num_batch % (snr_max + 1)
             val_snr_db = torch.full((batch_size,), val_snr_db, device=device, dtype=torch.float32)
-            val_rec, *_    = model(val_data, val_sum_stages, val_snr_db, m_idx, rvq_activate=True, apply_fading=args.fading, equalizer='zf')
+            val_rec, *_    = model(val_data, val_sum_stages, val_snr_db, m_idx, nsvq=args.nsvq, rvq_activate=True, apply_fading=args.fading, equalizer='zf')
             val_vq_loss_accumulator += F.mse_loss(val_rec, val_data).item()
             val_ssim_accumulator   += ms_ssim(val_rec, val_data, data_range=DATA_RANGE, size_average=True, win_size=7).item()
 
@@ -333,7 +376,7 @@ for epoch in range(max_epoch):
                 for stage in range(1, args.stages + 1):
                     for snr in range(0, snr_max + 1):
                         snr = torch.full((batch_size,), snr, device=device, dtype=torch.float32)
-                        out, *_ = model(ref_img, stage, snr, m_idx, rvq_activate=True)
+                        out, *_ = model(ref_img, stage, snr, m_idx, nsvq=args.nsvq, rvq_activate=True, apply_fading=args.fading, equalizer='zf')
                         out_img = inv_norm(out[0].cpu()).clamp(0, 1)
                         grid_imgs.append(out_img)
 
@@ -359,9 +402,9 @@ for epoch in range(max_epoch):
                     f"{save_address}{save_title}.pt")
             best_loss = avg_loss
 
-        eval_loss.append(round(avg_loss, 6))
-        eval_ssim.append(round(avg_ssim, 6))
-        np.save(f"{save_address}eval_loss_{save_title}.npy", np.asarray(eval_loss))
-        np.save(f"{save_address}eval_ssim_{save_title}.npy", np.asarray(eval_ssim))
+        # eval_loss.append(round(avg_loss, 6))
+        # eval_ssim.append(round(avg_ssim, 6))
+        # np.save(f"{save_address}eval_loss_{save_title}.npy", np.asarray(eval_loss))
+        # np.save(f"{save_address}eval_ssim_{save_title}.npy", np.asarray(eval_ssim))
 
     scheduler.step()

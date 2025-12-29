@@ -26,7 +26,7 @@ class SlidingWindowTransform:
 
 class DIV2K_Loader():
     def __init__(self, batch_size):
-        self.data_dir = '/home/cmluser56/data/DIV2K'  # 실제 데이터셋 경로로 변경
+        self.data_dir = '/mnt/data/wonjung/datasets/DIV2K'  # 실제 데이터셋 경로로 변경
         self.train_dir = os.path.join(self.data_dir, 'train')
         self.val_dir = os.path.join(self.data_dir, 'val')
         self.batch_size = batch_size
@@ -45,50 +45,104 @@ class DIV2K_Loader():
             ]),
         }
 
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+
+
+class FlatImageDataset(Dataset):
+    """
+    For a folder that contains images directly (no class subfolders).
+    Returns (image, dummy_label) by default to stay compatible with common training/eval loops.
+    """
+    def __init__(self, root, transform=None, return_path=False, sort=True):
+        self.root = root
+        self.transform = transform
+        self.return_path = return_path
+
+        paths = []
+        for ext in IMG_EXTS:
+            paths += glob(os.path.join(root, f"*{ext}"))
+            paths += glob(os.path.join(root, f"*{ext.upper()}"))
+        if sort:
+            paths = sorted(paths)
+
+        if len(paths) == 0:
+            raise RuntimeError(f"No images found in: {root}")
+        self.paths = paths
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+
+        dummy_label = 0
+        if self.return_path:
+            return img, dummy_label, path
+        return img, dummy_label
+
+
 class ImageNet_Loader():
     def __init__(self, batch_size, size, norm=True):
-        self.data_dir = '/data/dataset/imagenet'
+        self.data_dir = '/mnt/data/wonjung/datasets/ImageNet'
         self.train_dir = os.path.join(self.data_dir, 'train')
         self.val_dir = os.path.join(self.data_dir, 'val')
         self.batch_size = batch_size
-        self.norm = [[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]] if norm == True else [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+        self.norm = [[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]] if norm else [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+
         self.data_transforms = {
             'train': transforms.Compose([
-                transforms.CenterCrop(size*2),
+                transforms.CenterCrop(size * 2),
                 transforms.Resize(size),
                 transforms.ToTensor(),
                 transforms.Normalize(self.norm[0], self.norm[1])
             ]),
             'val': transforms.Compose([
-                transforms.CenterCrop(size*2),
+                transforms.CenterCrop(size * 2),
                 transforms.Resize(size),
                 transforms.ToTensor(),
                 transforms.Normalize(self.norm[0], self.norm[1])
             ]),
         }
+
+    def _val_has_class_folders(self):
+        # If val/ contains at least one subdirectory, assume ImageFolder structure.
+        # (You can tighten this check if needed.)
+        for name in os.listdir(self.val_dir):
+            p = os.path.join(self.val_dir, name)
+            if os.path.isdir(p) and not name.startswith("."):
+                return True
+        return False
+
     def dataset_load(self):
-        image_datasets = {
-            'train': datasets.ImageFolder(self.train_dir, self.data_transforms['train']),
-            'val': datasets.ImageFolder(self.val_dir, self.data_transforms['val'])
-        }
-        return image_datasets
+        train_dataset = datasets.ImageFolder(self.train_dir, self.data_transforms['train'])
+
+        if self._val_has_class_folders():
+            val_dataset = datasets.ImageFolder(self.val_dir, self.data_transforms['val'])
+        else:
+            val_dataset = FlatImageDataset(self.val_dir, transform=self.data_transforms['val'])
+
+        return {'train': train_dataset, 'val': val_dataset}
+
     def dataloader(self):
-        train_dataset = self.dataset_load()['train']
-        val_dataset = self.dataset_load()['val']
-
+        ds = self.dataset_load()
         dataloaders = {
-            'train': DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=3),
-            'val': DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=3)
+            'train': DataLoader(ds['train'], batch_size=self.batch_size, shuffle=True, num_workers=3),
+            'val': DataLoader(ds['val'], batch_size=self.batch_size, shuffle=False, num_workers=3)
         }
         return dataloaders
-    
+
     def raw_dataloader(self):
-        image_datasets = {
-            'train': datasets.ImageFolder(self.train_dir, transforms.Compose([transforms.Resize((128, 128)), transforms.ToTensor()])),
-            'val': datasets.ImageFolder(self.val_dir, transforms.Compose([transforms.Resize((128, 128)), transforms.ToTensor()]))
-        }
-        train_dataset = image_datasets['train']
-        val_dataset = image_datasets['val']
+        raw_tf = transforms.Compose([transforms.Resize((128, 128)), transforms.ToTensor()])
+
+        train_dataset = datasets.ImageFolder(self.train_dir, raw_tf)
+
+        if self._val_has_class_folders():
+            val_dataset = datasets.ImageFolder(self.val_dir, raw_tf)
+        else:
+            val_dataset = FlatImageDataset(self.val_dir, transform=raw_tf)
 
         dataloaders = {
             'train': DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=3),
@@ -96,15 +150,15 @@ class ImageNet_Loader():
         }
         return dataloaders
 
-    def dataloader_1k(self, fixed_val = False):
-        train_dataset = self.dataset_load()['train']
-        val_dataset = self.dataset_load()['val']
+    def dataloader_1k(self, fixed_val=False):
+        ds = self.dataset_load()
+        train_dataset, val_dataset = ds['train'], ds['val']
 
         num_train, num_val = len(train_dataset), len(val_dataset)
         subset_train_size, subset_val_size = int(0.1 * num_train), int(0.1 * num_val)
 
         train_indices = torch.randperm(num_train).tolist()[:subset_train_size]
-        if fixed_val == False:
+        if not fixed_val:
             val_indices = torch.randperm(num_val).tolist()[:subset_val_size]
         else:
             val_indices = torch.arange(num_val).tolist()[:subset_val_size]
@@ -113,15 +167,15 @@ class ImageNet_Loader():
         val_subset = Subset(val_dataset, val_indices)
 
         dataloaders = {
-            'train': DataLoader(train_subset, batch_size=self.batch_size, shuffle=True,num_workers=3, drop_last=True),
-            'val': DataLoader(val_subset, batch_size=self.batch_size, shuffle=False,num_workers=3, drop_last=True)
+            'train': DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=3, drop_last=True),
+            'val': DataLoader(val_subset, batch_size=self.batch_size, shuffle=False, num_workers=3, drop_last=True)
         }
-        return dataloaders        
+        return dataloaders    
 
 
 class Kodak_Patch_Loader(Dataset):
     def __init__(self, patch_size=(128, 128), norm=True):
-        self.base_path = '/data2/Kodak'
+        self.base_path = '/mnt/data/wonjung/datasets/Kodak'
         self.image_paths = glob(os.path.join(self.base_path, '*.png'))
         self.patch_size = patch_size
         self.patches = self.create_patches_from_images()

@@ -12,7 +12,7 @@ from pytorch_msssim import ms_ssim
 import lpips  # pip install lpips
 
 from dataloader import ImageNet_Loader, Kodak_Patch_Loader   # <- 여기만 test용 dataloader로 바꿔도 됨
-from networks import Digital_SemCom
+from networks import Digital_SemCom, Analog_SemCom, MobileNet_SemCom, MobileViT_SemCom
 
 # -------------------- 기본 설정 --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,20 +23,22 @@ parser = argparse.ArgumentParser(description="Test Digital_SemCom on new dataset
 parser.add_argument("--ckpt", type=str, required=True,
                     help="Path to trained checkpoint (.pt)")
 parser.add_argument("--model", type=str, default="gauss",
-                    help="Model name (for logging paths)")
+                    help="Model name (gauss or analog, for logging paths)")
+parser.add_argument("--target_cbr", type=float, default=1/64,
+                    help="Target channel bandwidth ratio (for Analog_SemCom)")
 parser.add_argument("--stages", type=int, default=4,
-                    help="Number of RVQ stages (must match training)")
+                    help="Number of RVQ stages (must match training; gauss 전용)")
 parser.add_argument("--bits", type=int, default=12,
-                    help="RVQ codeword bits (must match training)")
+                    help="RVQ codeword bits (must match training; gauss 전용)")
 parser.add_argument("--batch", type=int, default=36,
                     help="Test batch size")
 parser.add_argument("--norm", action="store_true",
                     help="Use same normalization as training")
 parser.add_argument("--m", type=str, default="0123",
-                    help="Modulation index sequence (e.g., '0123')")
+                    help="Modulation index sequence (e.g., '0123'; gauss 전용)")
 parser.add_argument("--img_size", type=int, default=128,
                     help="Test image size (must match training/model)")
-parser.add_argument("--dataset", type=str, default="ImageNet",
+parser.add_argument("--dataset", type=str, default="Kodak",
                     help="Dataset name (for your own use)")
 parser.add_argument("--out_dir", type=str, default="./test_output",
                     help="Directory to save test images and metrics")
@@ -45,11 +47,9 @@ args = parser.parse_args()
 # -------------------- 테스트 설정 --------------------
 # SNR: -5 dB ~ 20 dB, 1 dB 간격으로 테스트
 SNR_LIST = list(range(-5, 21, 1))  # [-5, -4, ..., 19, 20]
-
+# SNR_LIST = [0,5,10,15,20]
 # 이미지 저장은 이 SNR들에서만
 SAVE_SNR_LIST = [-5, 0, 5, 10, 15, 20]
-
-STAGES = list(range(1, args.stages + 1))
 
 # fading / 채널 모드 정의
 # ResUME.forward 내부에서 apply_fading, equalizer를 받는 구조라고 가정
@@ -66,16 +66,32 @@ lpips_fn.eval()
 vq_bitrate_per_stage = args.bits
 embedding_dim = 128  # 학습 때 사용한 값과 동일해야 함
 
-model = Digital_SemCom(
-    num_hiddens=128,
-    num_residual_hiddens=64,
-    num_residual_layers=4,
-    num_stages=args.stages,
-    vq_bitrate_per_stage=vq_bitrate_per_stage,
-    embedding_dim=embedding_dim,
-    batch_size=args.batch,
-    device=device,
-)
+if args.model == "gauss":
+    model = Digital_SemCom(
+        num_hiddens=128,
+        num_residual_hiddens=64,
+        num_residual_layers=4,
+        num_stages=args.stages,
+        vq_bitrate_per_stage=vq_bitrate_per_stage,
+        embedding_dim=embedding_dim,
+        batch_size=args.batch,
+        device=device,
+    )
+elif args.model == "analog":
+    model = Analog_SemCom(
+        num_hiddens=128,
+        num_residual_hiddens=64,
+        num_residual_layers=4,
+        embedding_dim=embedding_dim,
+        target_CBR=args.target_cbr,
+    )
+elif args.model == 'mobilenet':
+    model = MobileNet_SemCom(num_stages=4, vq_bitrate_per_stage=12, embedding_dim=embedding_dim, batch_size=args.batch, device=device)
+elif args.model == 'mobilevit':
+    model = MobileViT_SemCom(num_stages=4, vq_bitrate_per_stage=12, embedding_dim=embedding_dim, batch_size=args.batch, device=device)
+else:
+    raise ValueError(f"Unknown model type: {args.model}")
+
 ckpt = torch.load(args.ckpt, map_location=device)
 model.load_state_dict(ckpt["end_to_end_model"])
 model.to(device)
@@ -96,8 +112,16 @@ inv_std = [1 / s for s in std]
 inv_mean = [-m / s for m, s in zip(mean, std)]
 inv_norm = torchvision.transforms.Normalize(inv_mean, inv_std)
 
-# modulation index sequence
+# modulation index sequence (gauss 전용; analog에서는 실질적으로 사용 안 함)
 m_idx = [int(d) for d in args.m]
+
+# -------------------- STAGES 설정 --------------------
+# gauss: RVQ stage 개념 사용 -> 1..L까지 루프
+# analog: stage 개념 없음 -> 그냥 stage=1 하나만 사용해서 SNR별로만 테스트
+if args.model == "analog":
+    STAGES = [1]   # stage=1로만 간주해서 호환성 유지
+else:  # analog
+    STAGES = list(range(1, len(m_idx) + 1))
 
 os.makedirs(args.out_dir, exist_ok=True)
 
@@ -171,16 +195,31 @@ for ch_name, apply_fading, equalizer in CHANNEL_MODES:
                 snr_vec = torch.full((B,), float(snr_db), device=device, dtype=torch.float32)
 
                 with torch.no_grad():
-                    rec, *_ = model(
-                        x,
-                        stage,
-                        snr_vec,
-                        m_idx,
-                        nsvq=True,
-                        rvq_activate=True,
-                        apply_fading=apply_fading,
-                        equalizer=equalizer,
-                    )
+                    if args.model != "analog":
+                        # RVQ + 디지털 SemCom
+                        rec, *_ = model(
+                            x,
+                            stage,
+                            snr_vec,
+                            m_idx,
+                            nsvq=True,
+                            rvq_activate=True,
+                            apply_fading=apply_fading,
+                            equalizer=equalizer,
+                        )
+                    else:
+                        # Analog_SemCom: stage 개념은 무시하고(=1로 고정), RVQ off
+                        # 인터페이스 호환을 위해 같은 인자 구조를 유지
+                        rec, *_ = model(
+                            x,
+                            stage,          # 내부에서 사용하지 않거나, 단일 stage로만 간주
+                            snr_vec,
+                            m_idx,          # analog에서는 실제 사용 안 해도 됨
+                            nsvq=False,
+                            rvq_activate=False,
+                            apply_fading=apply_fading,
+                            equalizer=equalizer,
+                        )
 
                 # --- 역정규화 후 [0,1]에 clamp ---
                 x_denorm = inv_norm(x).clamp(0, 1)
