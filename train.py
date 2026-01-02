@@ -402,9 +402,9 @@ for epoch in range(max_epoch):
                     f"{save_address}{save_title}.pt")
             best_loss = avg_loss
 
-        # eval_loss.append(round(avg_loss, 6))
-        # eval_ssim.append(round(avg_ssim, 6))
-        # np.save(f"{save_address}eval_loss_{save_title}.npy", np.asarray(eval_loss))
-        # np.save(f"{save_address}eval_ssim_{save_title}.npy", np.asarray(eval_ssim))
+        eval_loss.append(round(avg_loss, 6))
+        eval_ssim.append(round(avg_ssim, 6))
+        np.save(f"{save_address}eval_loss_{save_title}.npy", np.asarray(eval_loss))
+        np.save(f"{save_address}eval_ssim_{save_title}.npy", np.asarray(eval_ssim))
 
     scheduler.step()

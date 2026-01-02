@@ -368,7 +368,7 @@ if __name__ == "__main__":
         max_bs, peak_mib = find_max_batch(
             builder, device=device,
             max_mem_mib=MAX_MEM_MIB,
-            start_bs=1, max_bs_cap=4096,
+            start_bs=1, max_bs_cap=6144,
             use_reserved=USE_RESERVED
         )
 
